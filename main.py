@@ -7,6 +7,7 @@ Uses CustomTkinter for a modern dark-themed Windows desktop application.
 
 import sys
 import logging
+import threading
 import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -22,6 +23,9 @@ from ui.import_tab import ImportTab
 from ui.cameras_tab import CamerasTab
 from ui.trends_tab import TrendsTab
 from ui.outliers_tab import OutliersTab
+from ui.accuracy_tab import AccuracyTab
+from ui.manual_review_tab import ManualReviewTab
+from ui.archive_tab import ArchiveTab
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -63,6 +67,8 @@ class ParkingAnalyticsApp(ctk.CTk):
 
         # Track which tabs are stale and need refresh
         self._stale_tabs: set[str] = set()
+        # Guard against concurrent refresh threads
+        self._refresh_lock = threading.Lock()
 
         self._build_ui()
         self._load_initial_data()
@@ -132,9 +138,12 @@ class ParkingAnalyticsApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(self, anchor="nw")
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(5, 5))
 
-        # Create tabs
+        # Create tabs — order matters for navigation
         self.tabview.add("Dashboard")
         self.tabview.add("Import Data")
+        self.tabview.add("Accuracy Analysis")
+        self.tabview.add("Manual Review Analysis")
+        self.tabview.add("Archive Analysis")
         self.tabview.add("Cameras")
         self.tabview.add("Trends")
         self.tabview.add("Outliers")
@@ -145,6 +154,15 @@ class ParkingAnalyticsApp(ctk.CTk):
 
         self.import_tab = ImportTab(self.tabview.tab("Import Data"), self)
         self.import_tab.pack(fill="both", expand=True)
+
+        self.accuracy_tab = AccuracyTab(self.tabview.tab("Accuracy Analysis"), self)
+        self.accuracy_tab.pack(fill="both", expand=True)
+
+        self.manual_review_tab = ManualReviewTab(self.tabview.tab("Manual Review Analysis"), self)
+        self.manual_review_tab.pack(fill="both", expand=True)
+
+        self.archive_tab = ArchiveTab(self.tabview.tab("Archive Analysis"), self)
+        self.archive_tab.pack(fill="both", expand=True)
 
         self.cameras_tab = CamerasTab(self.tabview.tab("Cameras"), self)
         self.cameras_tab.pack(fill="both", expand=True)
@@ -246,7 +264,10 @@ class ParkingAnalyticsApp(ctk.CTk):
 
     def _mark_all_stale(self) -> None:
         """Mark all data tabs as needing refresh."""
-        self._stale_tabs = {"Dashboard", "Cameras", "Trends", "Outliers"}
+        self._stale_tabs = {
+            "Dashboard", "Cameras", "Trends", "Outliers",
+            "Accuracy Analysis", "Manual Review Analysis", "Archive Analysis",
+        }
 
     def _refresh_active_tab(self) -> None:
         """Refresh the currently visible tab."""
@@ -255,22 +276,50 @@ class ParkingAnalyticsApp(ctk.CTk):
         self._refresh_tab(current)
 
     def _refresh_tab(self, tab_name: str) -> None:
-        """Refresh a specific tab by name."""
+        """Refresh a specific tab by name using a background thread."""
         tab_map = {
             "Dashboard": self.dashboard_tab,
             "Cameras": self.cameras_tab,
             "Trends": self.trends_tab,
             "Outliers": self.outliers_tab,
+            "Accuracy Analysis": self.accuracy_tab,
+            "Manual Review Analysis": self.manual_review_tab,
+            "Archive Analysis": self.archive_tab,
         }
         tab = tab_map.get(tab_name)
-        if tab:
+        if not tab:
+            return
+
+        self._status_label.configure(text=f"Loading {tab_name}...")
+        self.update_idletasks()
+
+        def _do_refresh():
+            if not self._refresh_lock.acquire(blocking=False):
+                return
             try:
                 tab.refresh()
-            except Exception as e:
+            except Exception:
                 logger.exception("Error refreshing %s tab", tab_name)
+            finally:
+                self._refresh_lock.release()
+                self.after(0, self._on_refresh_done)
+
+        thread = threading.Thread(target=_do_refresh, daemon=True)
+        thread.start()
+
+    def _on_refresh_done(self) -> None:
+        """Called on main thread after background refresh completes."""
+        self._status_label.configure(text="Ready")
 
     def on_data_changed(self) -> None:
         """Called by import_tab after data import or deletion."""
+        # Invalidate KPI cache
+        conn = database.get_connection()
+        try:
+            database.invalidate_cache(conn)
+        finally:
+            conn.close()
+
         self._refresh_filter_options()
         self._mark_all_stale()
         self._refresh_active_tab()

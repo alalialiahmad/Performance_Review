@@ -97,6 +97,13 @@ def init_db(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_transactions_upload ON transactions(upload_id);
             CREATE INDEX IF NOT EXISTS idx_transactions_date_lot_dir
                 ON transactions(date, lot_name, camera_direction);
+
+            CREATE TABLE IF NOT EXISTS kpi_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cache_key TEXT NOT NULL UNIQUE,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            );
         """)
         conn.commit()
         logger.info("Database initialized successfully at %s", db_path or DB_PATH)
@@ -249,3 +256,32 @@ def get_date_range(conn: sqlite3.Connection) -> tuple[Optional[str], Optional[st
     if row:
         return row[0], row[1]
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# KPI Cache Functions
+# ---------------------------------------------------------------------------
+
+def get_cache(conn: sqlite3.Connection, cache_key: str) -> Optional[str]:
+    """Return cached JSON string for the given cache key, or None if not found."""
+    cursor = conn.execute(
+        "SELECT data_json FROM kpi_cache WHERE cache_key = ?", (cache_key,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def set_cache(conn: sqlite3.Connection, cache_key: str, data_json: str) -> None:
+    """Store or update a cache entry."""
+    conn.execute(
+        "INSERT OR REPLACE INTO kpi_cache (cache_key, data_json) VALUES (?, ?)",
+        (cache_key, data_json)
+    )
+    conn.commit()
+
+
+def invalidate_cache(conn: sqlite3.Connection) -> None:
+    """Delete all cache entries. Called after data import or deletion."""
+    conn.execute("DELETE FROM kpi_cache")
+    conn.commit()
+    logger.info("KPI cache invalidated")

@@ -3,8 +3,11 @@ analytics.py — All KPI computations using the exact formulas specified.
 
 Pure computation module. Takes pandas DataFrames and returns computed KPIs
 at various aggregation levels (fleet, per-camera, per-lot, per-direction, daily).
+Includes a caching layer that stores computed results in SQLite for repeat access.
 """
 
+import hashlib
+import json
 import logging
 
 import pandas as pd
@@ -192,6 +195,11 @@ def compute_kpis(row: pd.Series) -> dict:
         kpis[f"{kpi_name}_color"] = get_kpi_color(kpi_name, kpis[kpi_name])
         kpis[f"{kpi_name}_status"] = get_kpi_status(kpi_name, kpis[kpi_name])
 
+    # Carry forward raw numeric columns for detailed analysis tabs
+    for col in NUMERIC_COLUMNS:
+        if col not in kpis:
+            kpis[col] = row.get(col, 0)
+
     return kpis
 
 
@@ -361,3 +369,97 @@ def compute_manual_review_breakdown(df: pd.DataFrame) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Caching Layer
+# ---------------------------------------------------------------------------
+
+def make_cache_key(date_start: str | None, date_end: str | None,
+                   lot_name: str | None, camera_direction: str | None) -> str:
+    """Generate a SHA-256 cache key from the current filter parameters."""
+    raw = f"{date_start}|{date_end}|{lot_name}|{camera_direction}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def compute_all_kpis(df: pd.DataFrame, filters: dict | None = None) -> dict:
+    """
+    Compute all KPI aggregations needed by the application, with SQLite caching.
+
+    On a cache miss: computes fleet, per-camera, daily, and review breakdown,
+    then stores the results as JSON in the kpi_cache table.
+
+    On a cache hit: deserializes from cache for instant loading.
+
+    Args:
+        df: Raw transactions DataFrame (used for computation on cache miss).
+        filters: Current filter dict with date_start, date_end, lot_name,
+                 camera_direction keys (used for cache key generation).
+
+    Returns:
+        Dict with keys:
+            fleet (dict), camera (pd.DataFrame), daily (pd.DataFrame),
+            review_breakdown (pd.DataFrame), from_cache (bool)
+    """
+    import database
+
+    cache_key = None
+    if filters:
+        cache_key = make_cache_key(
+            filters.get("date_start"), filters.get("date_end"),
+            filters.get("lot_name"), filters.get("camera_direction"),
+        )
+
+        # Try cache hit
+        conn = database.get_connection()
+        try:
+            cached_json = database.get_cache(conn, cache_key)
+        finally:
+            conn.close()
+
+        if cached_json:
+            try:
+                cached = json.loads(cached_json)
+                return {
+                    "fleet": cached["fleet"],
+                    "camera": pd.DataFrame(cached["camera"]),
+                    "daily": pd.DataFrame(cached["daily"]),
+                    "review_breakdown": pd.DataFrame(cached["review_breakdown"]),
+                    "from_cache": True,
+                }
+            except (json.JSONDecodeError, KeyError):
+                logger.warning("Cache entry corrupted, recomputing")
+
+    # Cache miss — compute everything
+    fleet = compute_fleet_kpis(df)
+    camera = compute_per_camera_kpis(df)
+    daily = compute_daily_kpis(df)
+    review_breakdown = compute_manual_review_breakdown(df)
+
+    result = {
+        "fleet": fleet,
+        "camera": camera,
+        "daily": daily,
+        "review_breakdown": review_breakdown,
+        "from_cache": False,
+    }
+
+    # Store in cache
+    if cache_key:
+        try:
+            serializable = {
+                "fleet": fleet,
+                "camera": camera.to_dict(orient="list") if not camera.empty else {},
+                "daily": daily.to_dict(orient="list") if not daily.empty else {},
+                "review_breakdown": (review_breakdown.to_dict(orient="list")
+                                     if not review_breakdown.empty else {}),
+            }
+            conn = database.get_connection()
+            try:
+                database.set_cache(conn, cache_key, json.dumps(serializable))
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("Failed to store cache entry", exc_info=True)
+
+    return result
