@@ -91,18 +91,36 @@ def validate_excel(file_path: str) -> tuple[bool, list[str]]:
 
     try:
         df = pd.read_excel(file_path, engine="openpyxl", nrows=0)
-        actual_cols = set(df.columns.str.strip())
-        expected_cols = set(EXPECTED_COLUMNS)
+        actual_cols_lower = set(c.strip().lower() for c in df.columns)
+        expected_cols_lower = {c.lower() for c in EXPECTED_COLUMNS}
 
-        missing = expected_cols - actual_cols
-        if missing:
-            errors.append(f"Missing columns: {', '.join(sorted(missing))}")
+        missing_lower = expected_cols_lower - actual_cols_lower
+        if missing_lower:
+            # Report using original expected names for clarity
+            missing_display = sorted(
+                c for c in EXPECTED_COLUMNS if c.lower() in missing_lower
+            )
+            errors.append(f"Missing columns: {', '.join(missing_display)}")
 
     except Exception as e:
         errors.append(f"Could not read Excel file: {e}")
         return False, errors
 
     return len(errors) == 0, errors
+
+
+def _build_column_rename_map(actual_columns: pd.Index) -> dict[str, str]:
+    """
+    Build a mapping from actual Excel column names to expected names,
+    matching case-insensitively after stripping whitespace.
+    """
+    expected_by_lower = {c.lower(): c for c in EXPECTED_COLUMNS}
+    rename_map = {}
+    for actual in actual_columns:
+        key = str(actual).strip().lower()
+        if key in expected_by_lower:
+            rename_map[actual] = expected_by_lower[key]
+    return rename_map
 
 
 def parse_excel(file_path: str) -> tuple[pd.DataFrame, list[str]]:
@@ -113,29 +131,35 @@ def parse_excel(file_path: str) -> tuple[pd.DataFrame, list[str]]:
     warnings = []
 
     df = pd.read_excel(file_path, engine="openpyxl")
-    df.columns = df.columns.str.strip()
+
+    # Normalize column names: strip whitespace and map to expected casing
+    col_rename = _build_column_rename_map(df.columns)
+    df = df.rename(columns=col_rename)
 
     # Normalize Date column to YYYY-MM-DD string
-    try:
-        df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.strftime("%Y-%m-%d")
-    except Exception:
+    if "Date" in df.columns:
         try:
-            df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
-        except Exception as e:
-            warnings.append(f"Date parsing issue: {e}")
+            df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.strftime("%Y-%m-%d")
+        except Exception:
+            try:
+                df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+            except Exception as e:
+                warnings.append(f"Date parsing issue: {e}")
 
     # Strip whitespace from string columns
     for col in ["Camera Name", "Camera Direction", "Lot Name"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    # Validate Camera Direction
-    valid_directions = {"IN", "OUT"}
-    invalid_mask = ~df["Camera Direction"].isin(valid_directions)
-    if invalid_mask.any():
-        count = invalid_mask.sum()
-        warnings.append(f"{count} rows with invalid Camera Direction dropped")
-        df = df[~invalid_mask].copy()
+    # Validate Camera Direction — normalize to uppercase before checking
+    if "Camera Direction" in df.columns:
+        df["Camera Direction"] = df["Camera Direction"].str.upper()
+        valid_directions = {"IN", "OUT"}
+        invalid_mask = ~df["Camera Direction"].isin(valid_directions)
+        if invalid_mask.any():
+            count = invalid_mask.sum()
+            warnings.append(f"{count} rows with invalid Camera Direction dropped")
+            df = df[~invalid_mask].copy()
 
     # Coerce numeric columns to integers
     for col in NUMERIC_EXCEL_COLUMNS:
